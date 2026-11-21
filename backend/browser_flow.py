@@ -11,6 +11,30 @@ from dataclasses import dataclass
 from item_time import in_window, refresh_age
 
 
+def is_platform_host(host):
+    return any(host == domain or host.endswith('.' + domain)
+               for domain in ('goofish.com', 'taobao.com', 'xianyu.com'))
+
+
+def platform_https_url(url):
+    if not isinstance(url, str) or '\\' in url or any(ord(c) <= 32 for c in url):
+        return None
+    try:
+        parts = urllib.parse.urlsplit(url)
+        if (parts.scheme == 'https' and parts.username is None and parts.password is None
+                and parts.port in (None, 443) and is_platform_host(parts.hostname or '')):
+            return parts
+    except ValueError:
+        pass
+    return None
+
+
+def is_search_response_url(url):
+    parts = platform_https_url(url)
+    return bool(parts and parts.hostname == 'h5api.m.goofish.com'
+                and parts.path.lower() == '/h5/mtop.taobao.idlemtopsearch.pc.search/1.0/')
+
+
 class Challenge(Exception):
     def __init__(self, url=None, rate_limited=False):
         self.url = url
@@ -75,7 +99,7 @@ class BrowserCollection:
 
     def _observe(self, response):
         # 只解析搜索主接口；激活接口、验证资源均不得当成商品响应。
-        if '/h5/mtop.taobao.idlemtopsearch.pc.search/1.0/' not in response.url.lower():
+        if not is_search_response_url(response.url):
             return
         try:
             request = self._request_data(response.request)
@@ -297,11 +321,7 @@ class BrowserCollection:
         # 优先保留页面自己的验证框。仅在没有框时打开平台给出的验证页。
         has_frame = any('punish' in f.url or 'x5sec' in f.url for f in self._page.frames)
         url = challenge.url or ''
-        parsed = urllib.parse.urlparse(url)
-        host = parsed.hostname or ''
-        safe = parsed.scheme == 'https' and any(host == d or host.endswith('.' + d)
-                                                for d in ('goofish.com', 'taobao.com', 'xianyu.com'))
-        if safe and not has_frame:
+        if not has_frame and platform_https_url(url):
             self._page.goto(url, wait_until='domcontentloaded', timeout=30000)
         end = time.monotonic() + self.VERIFY_TIMEOUT
         while time.monotonic() < end:

@@ -17,11 +17,12 @@ import hashlib
 import json
 import os
 import re
+import tempfile
 import time
 import urllib.parse
 import logging
 from item_time import refresh_age, in_window
-from browser_flow import BrowserCollection
+from browser_flow import BrowserCollection, is_platform_host, is_search_response_url, platform_https_url
 
 from playwright.sync_api import sync_playwright
 
@@ -47,6 +48,24 @@ HOME_URL = 'https://www.goofish.com/'
 
 # 登录成功后才会出现的 cookie（匿名会话里没有），用于判断是否已登录
 LOGIN_COOKIES = ('unb', 'cookie2', 'sgcookie')
+
+
+def _platform_cookies(cookies):
+    now = time.time()
+    for cookie in cookies:
+        if not isinstance(cookie, dict):
+            continue
+        domain = cookie.get('domain')
+        expires = cookie.get('expires', -1)
+        if (isinstance(domain, str) and is_platform_host(domain.lstrip('.').lower())
+                and isinstance(expires, (int, float)) and (expires == -1 or expires > now)):
+            yield cookie
+
+
+def _has_account_cookies(cookies):
+    names = {cookie.get('name') for cookie in _platform_cookies(cookies)}
+    return 'unb' in names and bool(names & {'cookie2', 'sgcookie'})
+
 
 # mtop 搜索接口相关（用于直接翻页请求）
 APPKEY = '34839810'
@@ -128,15 +147,21 @@ class Scraper(BrowserCollection):
                 if os.path.exists(SESSION_FILE) and not os.path.exists(os.path.join(DATA_DIR, 'browser-session.json')):
                     with open(SESSION_FILE, encoding='utf-8') as f:
                         old = json.load(f)
-                    self._context.add_cookies(old.get('cookies', []))
+                    self._context.add_cookies(list(_platform_cookies(old.get('cookies', []))))
                     for origin in old.get('origins', []):
                         if origin.get('origin') not in ('https://www.goofish.com', 'https://goofish.com'):
                             continue
                         seed = self._context.new_page()
                         try:
                             seed.goto(origin['origin'], wait_until='domcontentloaded')
-                            seed.evaluate('(entries) => entries.forEach(e => localStorage.setItem(e.name,e.value))',
-                                          origin.get('localStorage', []))
+                            # 导航可能发生重定向，只能在原始来源写入旧会话数据。
+                            if seed.evaluate('location.origin') != origin['origin']:
+                                continue
+                            seed.evaluate('''({origin, entries}) => {
+                                if (location.origin === origin) {
+                                    for (const e of entries) localStorage.setItem(e.name, e.value);
+                                }
+                            }''', {'origin': origin['origin'], 'entries': origin.get('localStorage', [])})
                         finally:
                             seed.close()
                 with open(marker, 'w', encoding='utf-8') as f:
@@ -159,14 +184,7 @@ class Scraper(BrowserCollection):
                 saved = json.load(source)
             existing = {(c['name'], c['domain'], c.get('path', '/')) for c in context.cookies()}
             missing = []
-            for cookie in saved.get('cookies', []):
-                host = cookie.get('domain', '').lstrip('.')
-                if not any(host == domain or host.endswith('.' + domain)
-                           for domain in ('goofish.com', 'taobao.com', 'xianyu.com')):
-                    continue
-                expires = cookie.get('expires', -1)
-                if expires != -1 and expires <= time.time():
-                    continue
+            for cookie in _platform_cookies(saved.get('cookies', [])):
                 key = (cookie['name'], cookie['domain'], cookie.get('path', '/'))
                 if key not in existing:
                     missing.append(cookie)
@@ -176,12 +194,20 @@ class Scraper(BrowserCollection):
             logging.warning('saved session unavailable; keeping existing browser session')
 
     def _save_session(self, context):
-        os.makedirs(os.path.dirname(SESSION_FILE), exist_ok=True)
+        os.makedirs(DATA_DIR, exist_ok=True)
         # 已有 session.json 保留原件，配置目录是新的会话来源。
         target = os.path.join(DATA_DIR, 'browser-session.json')
-        temporary = target + '.tmp'
-        context.storage_state(path=temporary)
-        os.replace(temporary, target)
+        # 恢复只需平台 cookie。其余站点及 localStorage 留在专用浏览器配置中。
+        snapshot = {'cookies': list(_platform_cookies(context.cookies())), 'origins': []}
+        out = tempfile.NamedTemporaryFile(dir=DATA_DIR, prefix='.browser-session-', suffix='.tmp',
+                                          delete=False, mode='w', encoding='utf-8')
+        try:
+            with out:
+                json.dump(snapshot, out, ensure_ascii=False)
+            os.replace(out.name, target)
+        finally:
+            if os.path.exists(out.name):
+                os.unlink(out.name)
 
     def close(self):
         failures = []
@@ -214,17 +240,13 @@ class Scraper(BrowserCollection):
         try:
             with open(session, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            names = {c.get('name') for c in data.get('cookies', [])
-                     if c.get('expires', -1) == -1 or c.get('expires', 0) > time.time()}
-            return 'unb' in names and bool(names & {'cookie2', 'sgcookie'})
+            return _has_account_cookies(data.get('cookies', []))
         except (json.JSONDecodeError, OSError, TypeError, AttributeError, ValueError):
             return False
 
     def _has_login_cookie(self, context):
         try:
-            names = {c.get('name') for c in context.cookies()
-                     if c.get('expires', -1) == -1 or c.get('expires', 0) > time.time()}
-            return 'unb' in names and bool(names & {'cookie2', 'sgcookie'})
+            return _has_account_cookies(context.cookies())
         except Exception:
             return False
 
@@ -260,7 +282,7 @@ class Scraper(BrowserCollection):
         page.wait_for_timeout(1000)
         needs_login = (not self._has_login_cookie(context) or self._on_login_page(page)
                        or self._login_prompt_visible(page))
-        if needs_login:
+        if needs_login and platform_https_url(page.url):
             self._click_login(page)
         logging.info('login: checking saved session, login_needed=%s', needs_login)
         deadline = time.monotonic() + self.LOGIN_TIMEOUT
@@ -270,7 +292,7 @@ class Scraper(BrowserCollection):
                 check()
             if page.is_closed():
                 return False
-            if (self._has_login_cookie(context) and not self._on_login_page(page)
+            if (platform_https_url(page.url) and self._has_login_cookie(context) and not self._on_login_page(page)
                     and not self._login_prompt_visible(page)):
                 if stable_since is None:
                     stable_since = time.monotonic()
@@ -418,7 +440,7 @@ class Scraper(BrowserCollection):
     def _capture_search(self, response, captured):
         try:
             u = response.url
-            if 'idlemtopsearch.pc.search' in u and 'activate' not in u:
+            if is_search_response_url(u):
                 ct = response.headers.get('content-type', '')
                 if 'json' in ct or 'text' in ct:
                     body = response.text()

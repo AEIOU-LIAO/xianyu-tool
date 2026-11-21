@@ -8,21 +8,26 @@
   POST /api/scrape     -> 触发一次抓取（后台线程执行）
   POST /api/login      -> 打开浏览器扫码登录（后台线程执行）
 
-启动：python backend/app.py   （浏览器访问 http://localhost:8000）
+启动：python backend/app.py   （浏览器访问 http://127.0.0.1:8000）
 """
 import json
 import mimetypes
 import os
+import socket
+import sys
 import threading
 import time
 import uuid
 import math
 import logging
 from logging.handlers import RotatingFileHandler
-from werkzeug.exceptions import BadRequest
+from pathlib import Path
+from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
+from werkzeug.serving import ThreadedWSGIServer
+from import_skins import pack_path
 from item_time import refresh_age
 
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, abort, jsonify, request, send_from_directory
 
 import seller_filter
 import storage
@@ -34,6 +39,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 mimetypes.add_type('image/webp', '.webp')
 
 app = Flask(__name__, static_folder=None)
+app.config['MAX_CONTENT_LENGTH'] = 64 * 1024  # API 只接收小型 JSON，不接收文件上传
 
 # 抓取器：headless=False 更稳（能看到扫码窗口），channel 用本机已装的 Edge
 scraper = Scraper(headless=False, channel='msedge')
@@ -82,38 +88,67 @@ def index():
     return send_from_directory(BASE_DIR, 'index.html')
 
 
-@app.route('/static/<path:filename>')
+def _public_skin_path(filename):
+    path = pack_path(Path(BASE_DIR), 'static/skins/' + filename)
+    if path.stat().st_nlink != 1:
+        raise ValueError('不允许发布硬链接')
+    return path
+
+
+@app.route('/static/skins/<path:filename>')
 def static_files(filename):
-    """壁纸等静态资源（static/skins/...）。"""
-    return send_from_directory(os.path.join(BASE_DIR, 'static'), filename)
+    """只发布清单与壁纸图片，旧皮肤包中的其他文件不对网页开放。"""
+    parts = filename.split('/')
+    if len(parts) == 2 and parts[0] == 'thumbs':
+        formats = {'.webp', '.png', '.jpg', '.jpeg', '.gif'}
+    elif len(parts) == 1:
+        formats = {'.webp'}
+    else:
+        abort(404)
+    if '\\' in filename or (filename != 'skins.json' and Path(filename).suffix.lower() not in formats):
+        abort(404)
+    try:
+        path = _public_skin_path(filename)
+    except (ValueError, OSError):
+        abort(404)
+    return send_from_directory(path.parent, path.name)
 
 
 @app.route('/api/skins')
 def api_skins():
-    path = os.path.join(BASE_DIR, 'static', 'skins', 'skins.json')
     try:
+        path = _public_skin_path('skins.json')
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         data = {'count': 0, 'roles': [], 'skins': []}
     return jsonify(data)
 
 
 ALLOWED_HOSTS = {'localhost:8000', '127.0.0.1:8000'}
-ALLOWED_ORIGINS = {'http://localhost:8000', 'http://127.0.0.1:8000'}
 
 
 @app.before_request
 def _guard_local():
     if request.host not in ALLOWED_HOSTS:
         return jsonify({'ok': False, 'msg': 'Host 不被允许'}), 403
+    if request.path.startswith('/api/') and request.headers.get('Sec-Fetch-Site') in ('cross-site', 'same-site'):
+        return jsonify({'ok': False, 'msg': '请求来源不被允许'}), 403
     if request.method in ('POST', 'PUT', 'PATCH', 'DELETE'):
+        local_origin = 'http://' + request.host
         origin = request.headers.get('Origin')
-        if origin and origin not in ALLOWED_ORIGINS:
+        if origin is not None and origin != local_origin:
             return jsonify({'ok': False, 'msg': '请求来源不被允许'}), 403
-        # 所有有请求体的写接口只接受对象，并预检字符串类型。
-        if request.content_length:
-            data = request.get_json(silent=True)
+        if origin is None and request.referrer and not request.referrer.startswith(local_origin + '/'):
+            return jsonify({'ok': False, 'msg': '请求来源不被允许'}), 403
+        if request.mimetype and not request.is_json:
+            raise BadRequest('请求体必须为 JSON 对象')
+        # 分块传输没有 Content-Length，与普通请求执行相同的限长、解析和字段校验。
+        if request.get_data():
+            try:
+                data = request.get_json(silent=True)
+            except RecursionError:
+                raise BadRequest('JSON 嵌套过深') from None
             if not isinstance(data, dict):
                 return jsonify({'ok': False, 'msg': '请求体必须为 JSON 对象'}), 400
             for field in ('keyword', 'city', 'key', 'mark', 'name', 'action', 'id'):
@@ -124,6 +159,26 @@ def _guard_local():
             if len(data.get('keyword', '')) > 60 or len(data.get('city', '')) > 30:
                 return jsonify({'ok': False, 'msg': '关键词或城市过长'}), 400
     return None
+
+
+@app.after_request
+def _secure_response(response):
+    policy = "frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action 'self'; connect-src 'self'"
+    if request.endpoint == 'static_files':
+        policy = "sandbox; default-src 'none'; frame-ancestors 'none'"
+    response.headers['Content-Security-Policy'] = policy
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['Cross-Origin-Resource-Policy'] = 'same-origin'
+    response.headers['Referrer-Policy'] = 'same-origin'
+    if request.path.startswith('/api/'):
+        response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def _too_large(error):
+    return jsonify({'ok': False, 'msg': '请求体过大'}), 413
 
 
 @app.errorhandler(BadRequest)
@@ -171,8 +226,10 @@ def _display_seller(it):
 
 def _csv_safe(value):
     """导出 CSV 时防止表格软件把文本当公式执行。"""
+    if isinstance(value, (int, float)):
+        return value
     s = '' if value is None else str(value)
-    if s[:1] in ('\t', '\r', '\n') or s.lstrip()[:1] in ('=', '+', '-', '@'):
+    if s[:1] in ('\t', '\r', '\n') or s.lstrip()[:1] in ('=', '+', '-', '@', '＝', '＋', '－', '＠'):
         return "'" + s
     return s
 
@@ -332,25 +389,26 @@ def api_export():
     out, *_ = _query_items(request.args)
 
     buf = io.StringIO()
-    writer = csv.writer(buf)
+    writer = csv.writer(buf, quoting=csv.QUOTE_ALL)
     writer.writerow(['标题', '价格', '区', '城市', '发布(天前)', '卖家', '卖家类型',
                      '嫌疑评分', '判定信号', '关键词', '商品链接', '图片链接'])
     type_label = {'personal': '个人卖家', 'pending': '待判定', 'reseller': '二道贩子'}
     for it in out:
-        writer.writerow([
-            _csv_safe(it.get('title', '')),
+        row = [
+            it.get('title', ''),
             it.get('price', ''),
-            _csv_safe(it.get('dist', '')),
-            _csv_safe(it.get('city', '')),
+            it.get('dist', ''),
+            it.get('city', ''),
             it.get('days_ago', ''),
-            _csv_safe(_display_seller(it)),
+            _display_seller(it),
             type_label.get(it.get('seller_type'), it.get('seller_type', '')),
             it.get('seller_score', ''),
-            _csv_safe('、'.join(it.get('seller_signals') or [])),
-            _csv_safe(it.get('keyword', '')),
-            _csv_safe(it.get('url', '')),
-            _csv_safe(it.get('pic_url', '')),
-        ])
+            '、'.join(it.get('seller_signals') or []),
+            it.get('keyword', ''),
+            it.get('url', ''),
+            it.get('pic_url', ''),
+        ]
+        writer.writerow(_csv_safe(value) for value in row)
 
     data = '﻿' + buf.getvalue()   # BOM，Excel 兼容
     filename = time.strftime('xianyu_%Y%m%d_%H%M.csv')
@@ -443,7 +501,7 @@ def _clean_item_snapshot(src):
     for f in _SNAPSHOT_FIELDS:
         v = src.get(f)
         numeric = f in ('days_ago', 'price', 'seller_score', 'published_at')
-        if numeric and isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v):
+        if numeric and type(v) in (int, float) and -sys.float_info.max <= v <= sys.float_info.max:
             out[f] = v
         elif not numeric and isinstance(v, str):
             out[f] = v[:1000]
@@ -810,7 +868,7 @@ def api_schedules_post():
 
 @app.route('/api/settings', methods=['GET', 'POST'])
 def api_settings():
-    if request.method == 'GET':
+    if request.method in ('GET', 'HEAD'):
         return jsonify(storage.load_settings())
     data = request.get_json(silent=True) or {}
     changes = {}
@@ -894,20 +952,36 @@ def _ensure_classified():
         print('已按当前识别规则重算 %d 条商品' % n, flush=True)
 
 
-if __name__ == '__main__':
+class LocalServer(ThreadedWSGIServer):
+    allow_reuse_address = os.name != 'nt'
+    allow_reuse_port = False
+
+    def server_bind(self):
+        if os.name == 'nt':
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
+def run_local_app():
     import webbrowser
-    os.makedirs(storage.DATA_DIR, exist_ok=True)
-    handler = RotatingFileHandler(os.path.join(storage.DATA_DIR, 'stability.log'),
-                                  maxBytes=1024 * 1024, backupCount=2, encoding='utf-8')
-    logging.basicConfig(level=logging.INFO, handlers=[handler],
-                        format='%(asctime)s %(levelname)s %(message)s')
-    _ensure_classified()
-    settings = storage.load_settings()
-    removed = storage.prune_items(settings.get('keep_days', 30), settings.get('max_items', 20000))
-    if removed:
-        print('启动清理：删除过期商品 %d 条' % removed)
-    threading.Thread(target=_scheduler_loop, daemon=True).start()
-    print('闲鱼同城助手后端启动：http://localhost:8000')
-    # 启动后 1.5 秒自动用默认浏览器打开页面
-    threading.Timer(1.5, lambda: webbrowser.open('http://localhost:8000')).start()
-    app.run(host='127.0.0.1', port=8000, debug=False, threaded=True)
+    # 先占用监听端口，再初始化运行数据并打开同一 IPv4 地址。
+    with LocalServer('127.0.0.1', 8000, app) as server:
+        os.makedirs(storage.DATA_DIR, exist_ok=True)
+        handler = RotatingFileHandler(os.path.join(storage.DATA_DIR, 'stability.log'),
+                                      maxBytes=1024 * 1024, backupCount=2, encoding='utf-8')
+        logging.basicConfig(level=logging.INFO, handlers=[handler],
+                            format='%(asctime)s %(levelname)s %(message)s')
+        _ensure_classified()
+        settings = storage.load_settings()
+        removed = storage.prune_items(settings.get('keep_days', 30), settings.get('max_items', 20000))
+        if removed:
+            print('启动清理：删除过期商品 %d 条' % removed)
+        threading.Thread(target=_scheduler_loop, daemon=True).start()
+        url = 'http://127.0.0.1:8000'
+        print('闲鱼同城助手后端启动：' + url)
+        threading.Thread(target=webbrowser.open, args=(url,), daemon=True).start()
+        server.serve_forever()
+
+
+if __name__ == '__main__':
+    run_local_app()

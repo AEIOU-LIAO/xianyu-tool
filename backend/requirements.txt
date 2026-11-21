@@ -1,2 +1,4 @@
 flask==3.1.3
+# Windows static-file serving requires the device-name fix in GHSA-g6x2-hccm-hh4m.
+Werkzeug>=3.1.9,<4
 playwright==1.64.1

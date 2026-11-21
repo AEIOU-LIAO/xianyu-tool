@@ -135,9 +135,9 @@ class BrowserCleanupTests(unittest.TestCase):
     def test_anonymous_cookie_does_not_count_as_login(self):
         obj=scraper.Scraper()
         ctx=Mock()
-        ctx.cookies.return_value=[{'name':'uc1'},{'name':'us'}]
+        ctx.cookies.return_value=[{'name':name, 'domain':'.goofish.com'} for name in ('uc1','us')]
         self.assertFalse(obj._has_login_cookie(ctx))
-        ctx.cookies.return_value=[{'name':'unb'},{'name':'cookie2'}]
+        ctx.cookies.return_value=[{'name':name, 'domain':'.goofish.com'} for name in ('unb','cookie2')]
         self.assertTrue(obj._has_login_cookie(ctx))
 
 

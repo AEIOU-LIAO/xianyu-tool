@@ -7,7 +7,7 @@ from playwright.sync_api import sync_playwright
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import scraper
 
-URL = 'https://login-fixture.invalid/'
+URL = 'https://www.goofish.com/'  # 所有请求均由下方 context.route 在本机响应。
 
 with sync_playwright() as pw:
     browser = pw.chromium.launch(channel='msedge', headless=True, chromium_sandbox=True)
