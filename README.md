@@ -19,7 +19,7 @@ python -m pip install -r backend/requirements.txt
 python backend/app.py
 ```
 
-浏览器访问 [http://localhost:8000](http://localhost:8000)。也可双击 `start.bat`；启动器检查到 8000 端口已有服务时仅打开网页，不会重启后端。更新后端源码后，应先关闭原服务，再重新启动。
+也可双击 `start.bat`。服务成功监听后会自动打开 [http://127.0.0.1:8000](http://127.0.0.1:8000)。如果提示端口被占用，已启动本工具时请使用原窗口，其他程序占用时请先释放端口。更新后端源码后，应先关闭原服务，再重新启动。之前在 `localhost` 下保存的浏览器外观偏好需要在新地址重新设置，商品和账号会话仍使用原数据目录。
 
 Playwright 直接使用本机 Edge，无需另行执行 `playwright install` 下载浏览器。服务默认仅监听 `127.0.0.1:8000`。
 
