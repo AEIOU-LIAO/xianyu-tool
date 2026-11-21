@@ -1,0 +1,66 @@
+# Local runtime data and authentication state
+/data/
+**/browser-profile/
+**/browser-profiles/
+**/user-data-dir/
+**/profile/
+**/profiles/
+session.json
+session-*.json
+browser-session.json
+storage-state*.json
+storage_state*.json
+cookies*.json
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Logs, captured data, screenshots and browser traces
+*.log
+*.log.*
+*.csv
+*.har
+/debug/
+/screenshots/
+/test-results/
+/playwright-report/
+*screenshot*.png
+*screenshot*.jpg
+*截图*.png
+*截图*.jpg
+
+# Optional local wallpaper assets
+/static/skins/
+
+# Python caches and environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# Local work, reports, backups and archives
+/work/
+/outputs/
+*.tmp
+*.bak
+*.corrupt-*
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
