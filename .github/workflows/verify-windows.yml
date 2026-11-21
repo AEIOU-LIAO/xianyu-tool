@@ -1,0 +1,28 @@
+name: Verify Windows security fixes
+on:
+  push:
+    branches: [verify/local-security-windows-20261121]
+permissions:
+  contents: read
+jobs:
+  offline-regression:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    env:
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install project dependencies
+        run: py -3.12 -m pip install -r backend/requirements.txt
+      - name: Unit and security tests
+        run: py -3.12 -B -m unittest discover -s backend/tests -v
+      - name: Offline Edge regressions
+        shell: pwsh
+        run: |
+          foreach ($suite in 'frontend_regression','frontend_security_regression','browser_controls_regression','sandbox_regression','login_regression','session_reuse_regression','transparency_regression') {
+            py -3.12 -B "backend/tests/$suite.py"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
